@@ -7,33 +7,21 @@ pg = require 'pg'
 LargeObjectManager = require('pg-large-object').LargeObjectManager
 Promise = require 'bluebird'
 
-generateUrl = (options) ->
-  host      = options.host or options.hostname or 'localhost'
-  port      = options.port or 5432
-  database  = options.database or 'test'
-  if options.username and options.password
-    return "postgres://#{options.username}:#{options.password}@#{host}:#{port}/#{database}"
-  else
-    return "postgres://#{host}:#{port}/#{database}"
+getDefaultSettings = (settings) ->
+  defaultSettings =
+    host: settings.hostname or 'localhost'
+    port: 5432
+    database: 'test'
+    table: 'files'
+    idleTimeoutMillis: 1000
+    max: 10
+    Promise: Promise
+  _.extend defaultSettings, settings
 
 class PostgresStorage
-  constructor: (@settings) ->
-    if not @settings.table
-      @settings.table = 'files'
-    if not @settings.url
-      @settings.url = generateUrl @settings
-
-  connect: (callback) ->
-    self = @
-    if @db
-      process.nextTick ->
-        if callback
-          callback null, self.db
-    else
-      self.db = new pg.Client self.settings.url
-      self.db.connect (err) ->
-        debug 'Postgres connection established: ' + self.settings.url
-        return callback err, self.db if callback
+  constructor: (settings) ->
+    @settings = getDefaultSettings settings
+    @db = new pg.Pool @settings
 
   getContainers: (callback) ->
     @db.query "select distinct container from #{@settings.table}", [], (err, res) ->
@@ -47,23 +35,31 @@ class PostgresStorage
 
   destroyContainer: (name, callback) ->
     self = @
-    self.db.query 'BEGIN TRANSACTION', (err) ->
-      return callback err if err
-      async.waterfall [
-        (done) ->
-          sql = "select lo_unlink(objectid) from #{self.settings.table} where container = $1"
-          self.db.query sql, [name], (err) ->
-            done err
-        (done) ->
-          sql = "delete from #{self.settings.table} where container = $1"
-          self.db.query sql, [name], done
-      ], (err, res) ->
-        if err
-          self.db.query 'ROLLBACK TRANSACTION', ->
-            callback err
-        else
-          self.db.query 'COMMIT TRANSACTION', (err) ->
-            return callback err, res
+    currentClient = null
+    closeConnection = (error, success) ->
+      currentClient?.release()
+      callback err, res
+
+    self.db.connect().then (client) ->
+      currentClient = client
+      currentClient.query 'BEGIN TRANSACTION', (err) ->
+        return closeConnection err if err
+        async.waterfall [
+          (done) ->
+            sql = "select lo_unlink(objectid) from #{self.settings.table} where container = $1"
+            currentClient.query sql, [name], (err) ->
+              done err
+          (done) ->
+            sql = "delete from #{self.settings.table} where container = $1"
+            currentClient.query sql, [name], done
+        ], (err, res) ->
+          if err
+            currentClient.query 'ROLLBACK TRANSACTION', ->
+              closeConnection err
+          else
+            currentClient.query 'COMMIT TRANSACTION', (err) ->
+              return closeConnection err, res
+    .catch closeConnection
 
   upload: (container, req, res, callback) ->
     self = @
@@ -87,27 +83,36 @@ class PostgresStorage
 
   uploadFile: (container, file, options, callback = (-> return)) ->
     self = @
-    handleError = (err) ->
-      self.db.query 'ROLLBACK TRANSACTION', ->
-        callback err
 
-    self.db.query 'BEGIN TRANSACTION', (err) ->
-      return callback err if err
-      # TODO parametrize bufferSize
-      bufferSize = 16384
-      man = new LargeObjectManager self.db
-      man.createAndWritableStream bufferSize, (err, objectid, stream) ->
-        return handleError err if err
-        stream.on 'finish', ->
-          self.db.query "insert into #{self.settings.table} (container, filename, mimetype, objectid) values ($1, $2, $3, $4) RETURNING *"
-          , [options.container, options.filename, options.mimetype, objectid]
-          , (err, res) ->
-            return handleError err if err
-            self.db.query 'COMMIT TRANSACTION', (err) ->
+    currentClient = null
+    closeConnection = (err, res) ->
+      currentClient?.release()
+      callback err, res
+
+    handleError = (err) ->
+      currentClient.query 'ROLLBACK TRANSACTION', ->
+        closeConnection err
+
+    self.db.connect().then (client) ->
+      currentClient = client
+      currentClient.query 'BEGIN TRANSACTION', (err) ->
+        return closeConnection err if err
+        # TODO parametrize bufferSize
+        bufferSize = 16384
+        man = new LargeObjectManager currentClient
+        man.createAndWritableStream bufferSize, (err, objectid, stream) ->
+          return handleError err if err
+          stream.on 'finish', ->
+            currentClient.query "insert into #{self.settings.table} (container, filename, mimetype, objectid) values ($1, $2, $3, $4) RETURNING *"
+            , [options.container, options.filename, options.mimetype, objectid]
+            , (err, res) ->
               return handleError err if err
-              callback null, res.rows[0]
-        stream.on 'error', handleError
-        file.pipe stream
+              currentClient.query 'COMMIT TRANSACTION', (err) ->
+                return handleError err if err
+                closeConnection null, res.rows[0]
+          stream.on 'error', handleError
+          file.pipe stream
+    .catch closeConnection
 
   getFiles: (container, callback) ->
     @db.query "select * from #{@settings.table} where container = $1", [container], callback
@@ -120,26 +125,35 @@ class PostgresStorage
 
   removeFileById: (id, callback) ->
     self = @
-    self.db.query 'BEGIN TRANSACTION', (err) ->
-      return callback err if err
-      async.waterfall [
-        (done) ->
-          sql = "select lo_unlink(objectid) from #{self.settings.table} where id = $1"
-          self.db.query sql, [id], (err) ->
-            done err
-        (done) ->
-          sql = "delete from #{self.settings.table} where id = $1"
-          self.db.query sql, [id], done
-      ], (err, res) ->
-        if err
-          self.db.query 'ROLLBACK TRANSACTION', ->
-            callback err
-        else
-          self.db.query 'COMMIT TRANSACTION', (err) ->
-            return callback err, res
 
-  getFileById: (id, callback) ->
-    @db.query "select * from #{@settings.table} where id = $1", [id], (err, res) ->
+    currentClient = null
+    closeConnection = (err, res) ->
+      currentClient?.release()
+      callback err, res
+
+    self.db.connect().then (client) ->
+      currentClient = client
+      currentClient.query 'BEGIN TRANSACTION', (err) ->
+        return closeConnection err if err
+        async.waterfall [
+          (done) ->
+            sql = "select lo_unlink(objectid) from #{self.settings.table} where id = $1"
+            currentClient.query sql, [id], (err) ->
+              done err
+          (done) ->
+            sql = "delete from #{self.settings.table} where id = $1"
+            currentClient.query sql, [id], done
+        ], (err, res) ->
+          if err
+            currentClient.query 'ROLLBACK TRANSACTION', ->
+              closeConnection err
+          else
+            currentClient.query 'COMMIT TRANSACTION', (err) ->
+              return closeConnection err, res
+    .catch closeConnection
+
+  getFileById: (currentClient, id, callback) ->
+    currentClient.query "select * from #{@settings.table} where id = $1", [id], (err, res) ->
       return callback err if err
       if not res or not res.rows or res.rows.length is 0
         err = new Error 'File not found'
@@ -158,12 +172,15 @@ class PostgresStorage
         return callback err
       callback null, res.rows[0]
 
-  _stream: (file, res, callback) ->
+  _stream: (client, file, res, callback) ->
     # TODO parametrize bufferSize
     bufferSize = 16384
-    man = new LargeObjectManager @db
+    man = new LargeObjectManager client
     man.openAndReadableStream file.objectid, bufferSize, (err, size, stream) ->
       return callback err if err
+      stream.on 'error', callback
+      stream.on 'end', callback
+
       res.set 'Content-Disposition', "attachment; filename=\"#{file.filename}\""
       res.set 'Content-Type', file.mimetype
       res.set 'Content-Length', size
@@ -171,19 +188,37 @@ class PostgresStorage
 
   downloadById: (id, res, callback = (-> return)) ->
     self = @
-    self.db.query 'BEGIN TRANSACTION', (err) ->
-      return callback err if err
-      self.getFileById id, (err, file) ->
-        return callback err if err
-        self._stream file, res, callback
+
+    currentClient = null
+    closeConnection = (err, res) ->
+      currentClient?.release()
+      callback err, res
+    self.db.connect().then (client) ->
+      currentClient = client
+
+      currentClient.query 'BEGIN TRANSACTION', (err) ->
+        return closeConnection err if err
+        self.getFileById currentClient, id, (err, file) ->
+          return closeConnection err if err
+          self._stream currentClient, file, res, closeConnection
+    .catch closeConnection
 
   download: (container, filename, res, callback = (-> return)) ->
     self = @
-    self.db.query 'BEGIN TRANSACTION', (err) ->
-      return callback err if err
-      self.getFile container, filename, (err, file) ->
-        return callback err if err
-        self._stream file, res, callback
+
+    currentClient = null
+    closeConnection = (err, res) ->
+      currentClient?.release()
+      callback err, res
+
+    self.db.connect().then (client) ->
+      currentClient = client
+      currentClient.query 'BEGIN TRANSACTION', (err) ->
+        return closeConnection err if err
+        self.getFile container, filename, (err, file) ->
+          return closeConnection err if err
+          self._stream currentClient, file, res, closeConnection
+    .catch closeConnection
 
 PostgresStorage.modelName = 'storage'
 
@@ -246,7 +281,7 @@ exports.initialize = (dataSource, callback) ->
   settings = dataSource.settings or {}
   connector = new PostgresStorage settings
   dataSource.connector = connector
-  dataSource.connector.pg = pg
+  dataSource.connector.pg = dataSource.connector.db
   dataSource.connector.dataSource = dataSource
   connector.DataAccessObject = -> return
   for m, method of PostgresStorage.prototype
@@ -255,6 +290,4 @@ exports.initialize = (dataSource, callback) ->
       for k, opt of method
         connector.DataAccessObject[m][k] = opt
   connector.define = (model, properties, settings) -> return
-  if callback
-    dataSource.connector.connect callback
   return
