@@ -5,7 +5,8 @@ DataSource = require('loopback-datasource-juggler').DataSource
 debug = require('debug') 'loopback:storage:postgres'
 pg = require 'pg'
 LargeObjectManager = require('pg-large-object').LargeObjectManager
-Promise = require 'bluebird'
+
+global.Promise = require 'bluebird' unless Promise?
 
 getDefaultSettings = (settings) ->
   defaultSettings =
@@ -26,17 +27,19 @@ class PostgresStorage
   getContainers: (callback) ->
     @db.query "select distinct container from #{@settings.table}", [], (err, res) ->
       callback err, res?.rows
+    return
 
   getContainer: (name, callback) ->
     @db.query "select * from #{@settings.table} where container = $1", [name], (err, res) ->
       callback err,
         container: name
         files: res?.rows
+    return
 
   destroyContainer: (name, callback) ->
     self = @
     currentClient = null
-    closeConnection = (error, success) ->
+    closeConnection = (err, res) ->
       currentClient?.release()
       callback err, res
 
@@ -60,6 +63,7 @@ class PostgresStorage
             currentClient.query 'COMMIT TRANSACTION', (err) ->
               return closeConnection err, res
     .catch closeConnection
+    return
 
   upload: (container, req, res, callback) ->
     self = @
@@ -80,6 +84,7 @@ class PostgresStorage
         return callback null, res
       .catch callback
     req.pipe busboy
+    return
 
   uploadFile: (container, file, options, callback = (-> return)) ->
     self = @
@@ -113,15 +118,18 @@ class PostgresStorage
           stream.on 'error', handleError
           file.pipe stream
     .catch closeConnection
+    return
 
   getFiles: (container, callback) ->
     @db.query "select * from #{@settings.table} where container = $1", [container], callback
+    return
 
   removeFile: (container, filename, callback) ->
     self = @
     self.getFile container, filename, (err, file) ->
       return callback err if err
       self.removeFileById file.id, callback
+    return
 
   removeFileById: (id, callback) ->
     self = @
@@ -151,6 +159,7 @@ class PostgresStorage
             currentClient.query 'COMMIT TRANSACTION', (err) ->
               return closeConnection err, res
     .catch closeConnection
+    return
 
   getFileById: (currentClient, id, callback) ->
     currentClient.query "select * from #{@settings.table} where id = $1", [id], (err, res) ->
@@ -160,6 +169,7 @@ class PostgresStorage
         err.status = 404
         return callback err
       callback null, res.rows[0]
+    return
 
   getFile: (container, filename, callback) ->
     @db.query "select * from #{@settings.table} where container = $1 and filename = $2"
@@ -171,6 +181,7 @@ class PostgresStorage
         err.status = 404
         return callback err
       callback null, res.rows[0]
+    return
 
   _stream: (client, file, res, callback) ->
     # TODO parametrize bufferSize
@@ -202,6 +213,7 @@ class PostgresStorage
           return closeConnection err if err
           self._stream currentClient, file, res, closeConnection
     .catch closeConnection
+    return
 
   download: (container, filename, res, callback = (-> return)) ->
     self = @
@@ -219,6 +231,7 @@ class PostgresStorage
           return closeConnection err if err
           self._stream currentClient, file, res, closeConnection
     .catch closeConnection
+    return
 
 PostgresStorage.modelName = 'storage'
 
@@ -277,7 +290,7 @@ PostgresStorage.prototype.download.accepts = [
 ]
 PostgresStorage.prototype.download.http = {verb: 'get', path: '/:container/download/:file'}
 
-exports.initialize = (dataSource, callback) ->
+exports.initialize = (dataSource) ->
   settings = dataSource.settings or {}
   connector = new PostgresStorage settings
   dataSource.connector = connector

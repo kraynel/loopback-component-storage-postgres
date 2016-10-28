@@ -1,25 +1,32 @@
 expect = require('chai').expect
 fs = require 'fs'
+LargeObjectManager = require('pg-large-object').LargeObjectManager
 loopback = require 'loopback'
 path = require 'path'
-StorageService = require '../source'
+Promise = require 'bluebird'
 request = require 'supertest'
-LargeObjectManager = require('pg-large-object').LargeObjectManager
+StorageService = require '../source'
 
 insertTestFile = (ds, done) ->
-  ds.connector.db.query 'BEGIN TRANSACTION', ->
-    man = new LargeObjectManager ds.connector.db
-    man.createAndWritableStream 16384, (err, oid, stream) ->
-      return done err if err
-      stream.on 'finish', ->
-        ds.connector.db.query 'INSERT INTO files (container, filename, mimetype, objectid) values ($1, $2, $3, $4)', ['my-cats', 'item.png', 'png', oid], (err, res) ->
-          ds.connector.db.query 'COMMIT TRANSACTION', ->
-            done err
-      stream.on 'error', (err) ->
-        ds.connector.db.query 'ROLLBACK TRANSACTION', ->
-          done err
-      read = fs.createReadStream path.join __dirname, 'files', 'item.png'
-      read.pipe stream
+  ds.connector.db.connect().then (client) ->
+    currentClient = client
+    closeConnection = (err) ->
+      currentClient?.release()
+      done err
+
+    currentClient.query 'BEGIN TRANSACTION', (err) ->
+      man = new LargeObjectManager currentClient
+      man.createAndWritableStream 16384, (err, oid, stream) ->
+        return closeConnection err if err
+        stream.on 'finish', ->
+          currentClient.query 'INSERT INTO files (container, filename, mimetype, objectid) values ($1, $2, $3, $4)', ['my-cats', 'item.png', 'png', oid], (err, res) ->
+            currentClient.query 'COMMIT TRANSACTION', ->
+              closeConnection err
+        stream.on 'error', (err) ->
+          currentClient.query 'ROLLBACK TRANSACTION', ->
+            closeConnection err
+        read = fs.createReadStream path.join __dirname, 'files', 'item.png'
+        read.pipe stream
 
 config =
   connector: StorageService
@@ -54,13 +61,6 @@ describe 'postgres connector', ->
 
       it 'should expose pg instance', ->
         expect(datasource.connector.pg).to.exist
-
-      it 'should create the url', ->
-        expect(datasource.settings.url).to.exist
-        expect(datasource.settings.url).to.eql "postgres://#{config.username}:#{config.password}@#{config.hostname}:#{config.port}/#{config.database}"
-
-      it 'should be connected', ->
-        expect(datasource.connected).to.eql true
 
   describe 'model usage', ->
 
